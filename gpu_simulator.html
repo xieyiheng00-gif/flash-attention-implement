@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GPU Block Scheduler Simulator</title>
+    <style>
+        :root {
+            --bg-color: #1e1e24;
+            --panel-bg: #2b2b36;
+            --text-color: #ffffff;
+            --block-color: #4a4e69;
+            --sm-color: #22223b;
+            --active-sm: #4caf50;
+            --completed-color: #9a8c98;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            overflow-x: hidden;
+        }
+
+        .dashboard {
+            background-color: var(--panel-bg);
+            padding: 20px;
+            border-radius: 10px;
+            width: 100%;
+            max-width: 900px;
+            box-shadow: 0 8px 16px rgba(0,0,0,0.3);
+        }
+
+        .controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #444;
+        }
+
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 14px;
+            transition: background-color 0.2s;
+        }
+
+        button:hover { background-color: #0056b3; }
+        button#resetBtn { background-color: #dc3545; }
+        button#resetBtn:hover { background-color: #a71d2a; }
+        button:disabled { background-color: #555; cursor: not-allowed; }
+
+        .section { margin-bottom: 30px; }
+        .section h3 { margin-top: 0; border-bottom: 2px solid #555; padding-bottom: 5px; }
+
+        /* Block Container Areas */
+        .block-container {
+            display: flex;
+            flex-wrap: wrap;
+            min-height: 50px;
+            background-color: #1a1a20;
+            padding: 10px;
+            border-radius: 8px;
+            gap: 5px;
+        }
+
+        /* The Physical Blocks */
+        .block {
+            display: inline-flex;
+            justify-content: center;
+            align-items: center;
+            width: 40px;
+            height: 40px;
+            background-color: var(--block-color);
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 14px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            /* Important: Transition for the FLIP animation */
+            transition: transform 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), background-color 0.4s ease;
+            z-index: 10;
+        }
+
+        /* SM (Hardware) Styling */
+        .sm-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            justify-content: center;
+        }
+
+        .sm {
+            width: 80px;
+            height: 100px;
+            background-color: var(--sm-color);
+            border: 2px solid #555;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding-top: 10px;
+            transition: border-color 0.3s;
+        }
+
+        .sm.busy {
+            border-color: var(--active-sm);
+            box-shadow: 0 0 15px rgba(76, 175, 80, 0.4);
+        }
+
+        .sm-title { font-size: 12px; color: #aaa; margin-bottom: 10px; }
+        
+        .sm-content {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+        }
+
+        /* Color states for blocks based on where they are */
+        .sm-content .block { background-color: var(--active-sm); }
+        #completedArea .block { background-color: var(--completed-color); }
+
+    </style>
+</head>
+<body>
+
+<div class="dashboard">
+    <h2>GigaThread Engine Simulator (Animated)</h2>
+    
+    <div class="controls">
+        <div class="control-group">
+            <label for="gridSize">Total Grid Size (Blocks): <span id="gridVal">24</span></label>
+            <input type="range" id="gridSize" min="10" max="100" value="24" oninput="document.getElementById('gridVal').innerText = this.value; updateInit()">
+        </div>
+        <div class="control-group">
+            <label for="smCount">Physical SMs (Hardware): <span id="smVal">4</span></label>
+            <input type="range" id="smCount" min="1" max="8" value="4" oninput="document.getElementById('smVal').innerText = this.value; updateInit()">
+        </div>
+        <div class="control-group" style="flex-direction: row; gap: 10px;">
+            <button id="runBtn" onclick="startKernel()">Run Kernel</button>
+            <button id="resetBtn" onclick="initSimulation()">Reset</button>
+        </div>
+    </div>
+
+    <div class="section">
+        <h3>Waiting Queue (GPU Global Memory)</h3>
+        <div id="waitingArea" class="block-container"></div>
+    </div>
+
+    <div class="section">
+        <h3>Streaming Multiprocessors (Active Execution)</h3>
+        <div id="smArea" class="sm-container"></div>
+    </div>
+
+    <div class="section">
+        <h3>Completed Blocks</h3>
+        <div id="completedArea" class="block-container"></div>
+    </div>
+</div>
+
+<script>
+    let gridTotal = 24;
+    let smTotal = 4;
+    let waitingQueue = [];
+    let smArray = []; 
+    let isRunning = false;
+    let activeTimers = [];
+
+    // The FLIP Animation Function (First, Last, Invert, Play)
+    function animateBlockMove(blockEl, targetContainer) {
+        // 1. FIRST: Get current position
+        const firstInfo = blockEl.getBoundingClientRect();
+        
+        // 2. LAST: Move the DOM element to the new container
+        targetContainer.appendChild(blockEl);
+        const lastInfo = blockEl.getBoundingClientRect();
+        
+        // 3. INVERT: Calculate the difference
+        const deltaX = firstInfo.left - lastInfo.left;
+        const deltaY = firstInfo.top - lastInfo.top;
+        
+        // Apply the difference instantly (no animation) to make it look like it never moved
+        blockEl.style.transition = 'none';
+        blockEl.style.transform = `translate(${deltaX}px, ${deltaY}px)`;
+        
+        // 4. PLAY: Force the browser to register the change, then animate to (0,0)
+        requestAnimationFrame(() => {
+            blockEl.style.transition = 'transform 0.4s cubic-bezier(0.25, 0.8, 0.25, 1), background-color 0.4s ease';
+            blockEl.style.transform = 'translate(0, 0)';
+        });
+    }
+
+    // Initialize the simulation
+    function initSimulation() {
+        isRunning = false;
+        document.getElementById('runBtn').disabled = false;
+        
+        activeTimers.forEach(timer => clearTimeout(timer));
+        activeTimers = [];
+
+        gridTotal = parseInt(document.getElementById('gridSize').value);
+        smTotal = parseInt(document.getElementById('smCount').value);
+
+        const waitingArea = document.getElementById('waitingArea');
+        const completedArea = document.getElementById('completedArea');
+        const smArea = document.getElementById('smArea');
+
+        // Clear existing DOM
+        waitingArea.innerHTML = '';
+        completedArea.innerHTML = '';
+        smArea.innerHTML = '';
+        waitingQueue = [];
+        
+        // Create actual DOM Elements for the blocks
+        for(let i = 0; i < gridTotal; i++) {
+            let el = document.createElement('div');
+            el.className = 'block';
+            el.id = 'block-' + i;
+            el.innerText = i;
+            waitingArea.appendChild(el);
+            waitingQueue.push(i);
+        }
+
+        // Create actual DOM Elements for the SMs
+        smArray = [];
+        for(let i = 0; i < smTotal; i++) {
+            let smDiv = document.createElement('div');
+            smDiv.className = 'sm';
+            smDiv.id = 'sm-wrapper-' + i;
+            
+            let title = document.createElement('div');
+            title.className = 'sm-title';
+            title.innerText = 'SM ' + i;
+            
+            // Dedicated container inside the SM to hold the block
+            let content = document.createElement('div');
+            content.className = 'sm-content';
+            content.id = 'sm-content-' + i;
+
+            smDiv.appendChild(title);
+            smDiv.appendChild(content);
+            smArea.appendChild(smDiv);
+
+            smArray.push({ id: i, busy: false, currentBlock: null });
+        }
+    }
+
+    function updateInit() {
+        if (!isRunning) initSimulation();
+    }
+
+    function startKernel() {
+        if (isRunning) return;
+        isRunning = true;
+        document.getElementById('runBtn').disabled = true;
+        scheduleBlocks();
+    }
+
+    function scheduleBlocks() {
+        if (!isRunning) return;
+
+        for (let i = 0; i < smTotal; i++) {
+            if (!smArray[i].busy && waitingQueue.length > 0) {
+                
+                let nextBlockId = waitingQueue.shift();
+                
+                smArray[i].busy = true;
+                smArray[i].currentBlock = nextBlockId;
+                
+                // Update SM visuals
+                document.getElementById('sm-wrapper-' + i).classList.add('busy');
+
+                // ANIMATE: Move block from waiting area to this SM
+                let blockEl = document.getElementById('block-' + nextBlockId);
+                let targetContainer = document.getElementById('sm-content-' + i);
+                animateBlockMove(blockEl, targetContainer);
+                
+                // Calculate random computation time
+                let computationTime = Math.floor(Math.random() * 1500) + 800; // slightly slower so you can see the animation
+                
+                let timer = setTimeout(() => finishBlock(i, nextBlockId), computationTime);
+                activeTimers.push(timer);
+            }
+        }
+        
+        if (waitingQueue.length === 0 && smArray.every(sm => !sm.busy)) {
+            isRunning = false;
+            document.getElementById('runBtn').disabled = false;
+        }
+    }
+
+    function finishBlock(smIndex, blockId) {
+        if (!isRunning) return;
+
+        // ANIMATE: Move block from SM to completed area
+        let blockEl = document.getElementById('block-' + blockId);
+        let completedArea = document.getElementById('completedArea');
+        animateBlockMove(blockEl, completedArea);
+        
+        // Free up the SM
+        smArray[smIndex].busy = false;
+        smArray[smIndex].currentBlock = null;
+        document.getElementById('sm-wrapper-' + smIndex).classList.remove('busy');
+        
+        // Schedule next block
+        scheduleBlocks(); 
+    }
+
+    window.onload = initSimulation;
+</script>
+
+</body>
+</html>
